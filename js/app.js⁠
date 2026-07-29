@@ -1,0 +1,444 @@
+let myChart = null;
+let chartData = [];
+let chipMap = {};
+let currentBacktestDays = 60;
+let stockProfiles = {
+    '2408': { name: '南亞科', mode: 'REVERSAL', bias: 2.0, chip: 300, trail: 2.5, sl: 2.2 },
+    '3037': { name: '欣興', mode: 'TREND', bias: 2.0, chip: 1000, trail: 3.0, sl: 2.0 },
+    '2327': { name: '國巨', mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 },
+    '3105': { name: '穩懋', mode: 'TREND', bias: 2.0, chip: 600, trail: 2.5, sl: 2.0 }
+};
+function roundToTaiwanTick(price) {
+    let tick = price >= 1000 ? 5.0 : (price >= 500 ? 1.0 : (price >= 100 ? 0.5 : (price >= 50 ? 0.1 : 0.05)));
+    return Math.round(price / tick) * tick;
+}
+function formatStockPrice(price) {
+    let rounded = roundToTaiwanTick(price);
+    return rounded >= 500 ? rounded.toFixed(0) : rounded.toFixed(2);
+}
+setInterval(() => {
+    const clockEl = document.getElementById('clock');
+    if(clockEl) clockEl.innerText = new Date().toTimeString().split(' ')[0];
+}, 1000);
+function calculateMA(dayCount, data) {
+    let result = [];
+    for (let i = 0, len = data.length; i < len; i++) {
+        if (i < dayCount) { result.push(null); continue; }
+        let sum = 0;
+        for (let j = 0; j < dayCount; j++) sum += data[i - j].close;
+        result.push(Number((sum / dayCount).toFixed(2)));
+    }
+    return result;
+}
+function initChart() {
+    const chartDom = document.getElementById('kline-chart');
+    if (!chartDom) return;
+    if (myChart) myChart.dispose();
+    myChart = echarts.init(chartDom, 'dark');
+    window.addEventListener('resize', () => { if (myChart) myChart.resize(); });
+}
+function renderChart(dataSlice, symbol) {
+    if (!dataSlice || dataSlice.length === 0 || !myChart) return;
+    const dates = dataSlice.map(item => item.date);
+    const values = dataSlice.map(item => [item.open, item.close, item.low, item.high]);
+    const ma20 = calculateMA(20, dataSlice);
+    const option = {
+        backgroundColor: 'transparent',
+        tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
+        grid: { left: '8%', right: '4%', bottom: '18%', top: '8%' },
+        xAxis: { type: 'category', data: dates, axisLine: { lineStyle: { color: '#334155' } } },
+        yAxis: { scale: true, splitLine: { lineStyle: { color: '#1e293b' } } },
+        dataZoom: [{ type: 'inside', start: 60, end: 100 }, { type: 'slider', show: true, bottom: '4%', height: 18, start: 60, end: 100 }],
+        series: [
+            { name: `${symbol} K線`, type: 'candlestick', data: values, itemStyle: { color: '#ef4444', color0: '#10b981', borderColor: '#ef4444', borderColor0: '#10b981' } },
+            { name: 'MA20', type: 'line', data: ma20, smooth: true, showSymbol: false, lineStyle: { color: '#f59e0b', width: 1.5 } }
+        ]
+    };
+    myChart.setOption(option);
+}
+function selectStock(symbol) {
+    ['2408', '3037', '2327', '3105'].forEach(s => {
+        const btn = document.getElementById(`q-${s}`);
+        if(btn) btn.className = s === symbol ? 'btn btn-active' : 'btn';
+    });
+    const symbolInput = document.getElementById('stock-symbol');
+    if(symbolInput) symbolInput.value = symbol;
+    if (!stockProfiles[symbol]) {
+        stockProfiles[symbol] = { name: symbol, mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+    }
+    const profile = stockProfiles[symbol];
+    document.getElementById('input-mode').value = profile.mode;
+    document.getElementById('input-bias-threshold').value = profile.bias;
+    document.getElementById('input-chip-threshold').value = profile.chip;
+    document.getElementById('input-trailing-back').value = profile.trail;
+    document.getElementById('input-sl').value = profile.sl;
+    document.getElementById('val-symbol-tag').innerText = symbol;
+    document.getElementById('val-mode-tag').innerText = profile.mode === 'TREND' ? '自動順勢' : '自動逆勢';
+    fetchFinMindData();
+}
+function onSymbolManualChange() {
+    const symbol = document.getElementById('stock-symbol').value.trim();
+    if (symbol) {
+        if (!stockProfiles[symbol]) {
+            stockProfiles[symbol] = { name: symbol, mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+        }
+        selectStock(symbol);
+    }
+}
+function saveCurrentInputToProfile() {
+    const symbol = document.getElementById('stock-symbol').value.trim();
+    if (!symbol) return;
+    const modeVal = document.getElementById('input-mode').value;
+    stockProfiles[symbol] = {
+        name: symbol,
+        mode: modeVal,
+        bias: parseFloat(document.getElementById('input-bias-threshold').value),
+        chip: parseFloat(document.getElementById('input-chip-threshold').value),
+        trail: parseFloat(document.getElementById('input-trailing-back').value),
+        sl: parseFloat(document.getElementById('input-sl').value)
+    };
+    document.getElementById('val-mode-tag').innerText = modeVal === 'TREND' ? '自動順勢' : '自動逆勢';
+    loadStrategiesForSymbol(symbol);
+    runBacktestCalculation();
+    addLog(`[參數更新] 已自動儲存 [${symbol}] 的個股專屬設定`);
+}
+async function fetchFinMindData() {
+    const bar = document.getElementById('progress-bar');
+    const symbolInput = document.getElementById('stock-symbol');
+    const symbol = symbolInput ? symbolInput.value.trim() : '2327';
+    if(bar) bar.style.width = '30%';
+    addLog(`[API連線] 正在載入 [${symbol}] 數據與全軌跡引擎...`);
+    const startDate = '2023-01-01';
+    const endDate = new Date().toISOString().split('T')[0];
+    const klineUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockPrice&data_id=${symbol}&start_date=${startDate}&end_date=${endDate}`;
+    const chipUrl = `https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id=${symbol}&start_date=${startDate}&end_date=${endDate}`;
+    try {
+        const [klineRes, chipRes] = await Promise.all([
+            fetch(klineUrl).then(r => r.json()),
+            fetch(chipUrl).then(r => r.json())
+        ]);
+        if (klineRes.status === 200 && klineRes.data) {
+            chartData = klineRes.data.map(item => ({
+                date: item.date,
+                open: Number(Number(item.open).toFixed(2)),
+                close: Number(Number(item.close).toFixed(2)),
+                low: Number(Number(item.min !== undefined ? item.min : item.low).toFixed(2)),
+                high: Number(Number(item.max !== undefined ? item.max : item.high).toFixed(2)),
+            }));
+            chipMap = {};
+            if (chipRes.status === 200 && chipRes.data) {
+                chipRes.data.forEach(item => {
+                    if (!chipMap[item.date]) chipMap[item.date] = 0;
+                    if (item.name === 'Foreign_Investor' || item.name === 'Investment_Trust') {
+                        chipMap[item.date] += Math.round((item.buy - item.sell) / 1000);
+                    }
+                });
+            }
+            renderChart(chartData, symbol);
+            loadStrategiesForSymbol(symbol);
+            runBacktestCalculation();
+            addLog(`[成功] [${symbol}] 專屬數據載入完成！`);
+        }
+    } catch (err) {
+        addLog(`[錯誤] 數據載入失敗: ${err.message}`, false);
+    } finally {
+        if(bar) {
+            bar.style.width = '100%';
+            setTimeout(() => bar.style.width = '0%', 300);
+        }
+    }
+}
+function addLog(msg, isUp = true) {
+    const terminal = document.getElementById('log-terminal');
+    if (!terminal) return;
+    const item = document.createElement('div');
+    item.className = `log-item ${isUp ? 'up-text' : 'down-text'}`;
+    const time = new Date().toTimeString().split(' ')[0];
+    item.innerHTML = `<span class="log-time">[${time}]</span> ${msg}`;
+    terminal.insertBefore(item, terminal.firstChild);
+}
+function loadStrategiesForSymbol(symbol) {
+    const list = document.getElementById('strategy-list');
+    if(!list) return;
+    const p = stockProfiles[symbol] || { mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+    const modeName = p.mode === 'TREND' ? '順勢前日收盤防護' : '逆勢前日收盤防護';
+    const modeClass = p.mode === 'TREND' ? 'tag-red' : 'tag-green';
+    list.innerHTML = `
+        <div class="strategy-card">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+                <h4>${symbol} 專屬邏輯設定</h4>
+                <span class="tag ${modeClass}">${modeName}</span>
+            </div>
+            <p><strong>專屬參數:</strong> 乖離>${p.bias}% | 籌碼>${p.chip}張 | 回撤-${p.trail}% / 停損-${p.sl}%</p>
+            <button class="btn btn-primary" onclick="showReport()">⚡ 執行 [${symbol}] 完整回測</button>
+        </div>
+    `;
+}
+function runAutoOptimization() {
+    if (!chartData || chartData.length < 40) {
+        alert('請先等待圖表與歷史數據載入完成！');
+        return;
+    }
+    const symbol = document.getElementById('stock-symbol').value.trim() || '2327';
+    addLog(`[AI優化] 開始為 [${symbol}] 掃描最佳參數...`);
+    const modeOptions = ['TREND', 'REVERSAL'];
+    const biasOptions = [1.0, 1.5, 2.0];
+    const chipOptions = [300, 500];
+    const trailOptions = [2.0, 2.5, 3.0];
+    const slOptions = [1.5, 2.0, 2.5];
+    let bestScore = -999;
+    let bestConfig = stockProfiles[symbol] || { name: symbol, mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+    for (let mode of modeOptions) {
+        for (let bias of biasOptions) {
+            for (let chip of chipOptions) {
+                for (let trail of trailOptions) {
+                    for (let sl of slOptions) {
+                        let sim = simulateBacktestScore(mode, bias, chip, trail, sl);
+                        let score = sim.totalPnl * sim.pf * (sim.winRate / 100);
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestConfig = { name: symbol, mode, bias, chip, trail, sl };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    stockProfiles[symbol] = bestConfig;
+    document.getElementById('input-mode').value = bestConfig.mode;
+    document.getElementById('input-bias-threshold').value = bestConfig.bias;
+    document.getElementById('input-chip-threshold').value = bestConfig.chip;
+    document.getElementById('input-trailing-back').value = bestConfig.trail;
+    document.getElementById('input-sl').value = bestConfig.sl;
+    document.getElementById('val-mode-tag').innerText = bestConfig.mode === 'TREND' ? '自動順勢' : '自動逆勢';
+    loadStrategiesForSymbol(symbol);
+    runBacktestCalculation();
+    addLog(`[AI優化成功] [${symbol}] 已切換至最佳模式！`);
+    showReport();
+}
+function simulateBacktestScore(mode, biasThres, chipThres, trailVal, slVal) {
+    let trailRatio = trailVal / 100;
+    let slRatio = slVal / 100;
+    let totalPnl = 0, grossProfit = 0, grossLoss = 0, winCount = 0, totalTrades = 0;
+    const startIdx = chartData.length - 30;
+    for (let i = startIdx; i < chartData.length; i++) {
+        let dayItem = chartData[i];
+        let prevDayItem = chartData[i - 1];
+        let prevPrevDayItem = chartData[i - 2];
+        let sum20 = 0;
+        for (let j = i - 21; j < i - 1; j++) sum20 += chartData[j].close;
+        let ma20 = sum20 / 20;
+        let bias = ((prevDayItem.close - ma20) / ma20) * 100;
+        let isLong = (mode === 'TREND') ? (bias >= 0) : (bias < 0);
+        let entry = dayItem.open;
+        let pnlRatio = 0;
+        totalTrades++;
+        let hardStopPrice = isLong ? entry * (1 - slRatio) : entry * (1 + slRatio);
+        if (isLong) {
+            let stopPrice = Math.min(prevPrevDayItem.low, hardStopPrice);
+            let profitPeakPrice = dayItem.high;
+            let profitPeakGain = (profitPeakPrice - entry) / entry;
+            if (dayItem.low <= hardStopPrice) {
+                pnlRatio = -slVal;
+            } else if (profitPeakGain > 0.005 && (profitPeakPrice - dayItem.close) / profitPeakPrice >= trailRatio) {
+                let actualExit = profitPeakPrice * (1 - trailRatio);
+                pnlRatio = ((actualExit - entry) / entry) * 100;
+            } else if (dayItem.close <= stopPrice) {
+                pnlRatio = ((stopPrice - entry) / entry) * 100;
+            } else {
+                pnlRatio = ((dayItem.close - entry) / entry) * 100;
+            }
+        } else {
+            let stopPrice = Math.max(prevPrevDayItem.high, hardStopPrice);
+            let profitPeakPrice = dayItem.low;
+            let profitPeakGain = (entry - profitPeakPrice) / entry;
+            if (dayItem.high >= hardStopPrice) {
+                pnlRatio = -slVal;
+            } else if (profitPeakGain > 0.005 && (dayItem.close - profitPeakPrice) / profitPeakPrice >= trailRatio) {
+                let actualExit = profitPeakPrice * (1 + trailRatio);
+                pnlRatio = ((entry - actualExit) / entry) * 100;
+            } else if (dayItem.close >= stopPrice) {
+                pnlRatio = ((entry - stopPrice) / entry) * 100;
+            } else {
+                pnlRatio = ((entry - dayItem.close) / entry) * 100;
+            }
+        }
+        totalPnl += pnlRatio;
+        if (pnlRatio > 0) { winCount++; grossProfit += pnlRatio; }
+        else { grossLoss += Math.abs(pnlRatio); }
+    }
+    let pf = grossLoss === 0 ? grossProfit : grossProfit / grossLoss;
+    let winRate = totalTrades > 0 ? (winCount / totalTrades) * 100 : 0;
+    return { totalPnl, pf, winRate };
+}
+function changeBacktestDays(days) {
+    currentBacktestDays = days;
+    document.getElementById('btn-15d').className = days === 15 ? 'btn btn-active' : 'btn';
+    document.getElementById('btn-30d').className = days === 30 ? 'btn btn-active' : 'btn';
+    document.getElementById('btn-60d').className = days === 60 ? 'btn btn-active' : 'btn';
+    runBacktestCalculation();
+}
+function showReport() {
+    runBacktestCalculation();
+    const modal = document.getElementById('report-modal');
+    if(modal) modal.style.display = 'flex';
+}
+function runBacktestCalculation() {
+    if (!chartData || chartData.length < currentBacktestDays + 25) return;
+    const symbol = document.getElementById('stock-symbol').value;
+    const p = stockProfiles[symbol] || { mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+    document.getElementById('val-trail-box').innerText = `${p.sl}%`;
+    document.getElementById('modal-title').innerText = `[${symbol} 完整足跡回測] 近 ${currentBacktestDays} 個交易日 (${p.mode})`;
+    let trailRatio = p.trail / 100;
+    let slRatio = p.sl / 100;
+    const tbody = document.getElementById('modal-trades');
+    if(!tbody) return;
+    tbody.innerHTML = '';
+    let totalPnl = 0, grossProfit = 0, grossLoss = 0, winCount = 0, tradeCount = 0, maxLoss = 0;
+    const startIdx = chartData.length - currentBacktestDays;
+    let counter = 1;
+    for (let i = startIdx; i < chartData.length; i++) {
+        let dayItem = chartData[i];
+        let prevDayItem = chartData[i - 1];
+        let prevPrevDayItem = chartData[i - 2];
+        let sum20 = 0;
+        for (let j = i - 21; j < i - 1; j++) sum20 += chartData[j].close;
+        let ma20 = sum20 / 20;
+        let bias = ((prevDayItem.close - ma20) / ma20) * 100;
+        let prevChip = chipMap[prevDayItem.date] || 0;
+        let isLong = (p.mode === 'TREND') ? (bias >= 0) : (bias < 0);
+        let actionText = isLong ? '做多' : '做空';
+        let entry = dayItem.open; 
+        let pnlRatio = 0, exitPrice = entry, statusText = '【收盤結算】';
+        tradeCount++;
+        let hardStopPrice = isLong ? roundToTaiwanTick(entry * (1 - slRatio)) : roundToTaiwanTick(entry * (1 + slRatio));
+        if (isLong) {
+            let stopPrice = roundToTaiwanTick(Math.min(prevPrevDayItem.low, hardStopPrice));
+            let profitPeakPrice = dayItem.high;
+            let profitPeakGain = (profitPeakPrice - entry) / entry;
+            if (dayItem.low <= hardStopPrice) {
+                exitPrice = hardStopPrice;
+                pnlRatio = -p.sl;
+                statusText = '⚡【硬性停損】';
+            } else if (profitPeakGain > 0.005 && (profitPeakPrice - dayItem.close) / profitPeakPrice >= trailRatio) {
+                exitPrice = roundToTaiwanTick(profitPeakPrice * (1 - trailRatio));
+                pnlRatio = ((exitPrice - entry) / entry) * 100;
+                statusText = '🛡️【回吐保本】';
+            } else if (dayItem.close <= stopPrice) {
+                exitPrice = stopPrice;
+                pnlRatio = ((exitPrice - entry) / entry) * 100;
+                statusText = '⚡【破底防守】';
+            } else {
+                exitPrice = roundToTaiwanTick(dayItem.close);
+                pnlRatio = ((exitPrice - entry) / entry) * 100;
+                statusText = pnlRatio >= 2.5 ? '🔥【肥美收盤】' : '📌【收盤結算】';
+            }
+        } else {
+            let stopPrice = roundToTaiwanTick(Math.max(prevPrevDayItem.high, hardStopPrice));
+            let profitPeakPrice = dayItem.low;
+            let profitPeakGain = (entry - profitPeakPrice) / entry;
+            if (dayItem.high >= hardStopPrice) {
+                exitPrice = hardStopPrice;
+                pnlRatio = -p.sl;
+                statusText = '⚡【硬性停損】';
+            } else if (profitPeakGain > 0.005 && (dayItem.close - profitPeakPrice) / profitPeakPrice >= trailRatio) {
+                exitPrice = roundToTaiwanTick(profitPeakPrice * (1 + trailRatio));
+                pnlRatio = ((entry - exitPrice) / entry) * 100;
+                statusText = '🛡️【回吐保本】';
+            } else if (dayItem.close >= stopPrice) {
+                exitPrice = stopPrice;
+                pnlRatio = ((entry - exitPrice) / entry) * 100;
+                statusText = '⚡【突破防守】';
+            } else {
+                exitPrice = roundToTaiwanTick(dayItem.close);
+                pnlRatio = ((entry - exitPrice) / entry) * 100;
+                statusText = pnlRatio >= 2.5 ? '🔥【肥美收盤】' : '📌【收盤結算】';
+            }
+        }
+        totalPnl += pnlRatio;
+        if (pnlRatio > 0) { winCount++; grossProfit += pnlRatio; }
+        else { grossLoss += Math.abs(pnlRatio); }
+        if (pnlRatio < maxLoss) maxLoss = pnlRatio;
+        let tagClass = isLong ? 'tag-red' : 'tag-green';
+        let pnlStyle = 'text-align:right; font-weight:bold; background: transparent; padding: 0; ';
+        if (pnlRatio > 0) { pnlStyle += 'color: var(--tw-up-red);'; }
+        else if (pnlRatio < 0) { pnlStyle += 'color: var(--tw-down-green);'; }
+        else { pnlStyle += 'color: var(--text-main);'; }
+        tbody.innerHTML += `
+            <tr>
+                <td style="text-align:center; color: var(--text-main);">${counter++}</td>
+                <td style="text-align:center; color: var(--text-main);">${dayItem.date}</td>
+                <td style="text-align:center; color: var(--text-main);">${prevChip > 0 ? '+':''}${prevChip} 張</td>
+                <td style="text-align:center;"><span class="tag ${tagClass}">${actionText} ${statusText}</span></td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(prevDayItem.close)}</td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(dayItem.open)}</td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(dayItem.high)}</td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(dayItem.low)}</td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(entry)}</td>
+                <td style="text-align:right; color: var(--text-main);">${formatStockPrice(exitPrice)}</td>
+                <td style="${pnlStyle}">${(pnlRatio > 0 ? '+' : '') + pnlRatio.toFixed(2)}%</td>
+            </tr>
+        `;
+    }
+    let finalPF = grossLoss === 0 ? grossProfit : (grossProfit / grossLoss);
+    const mRetEl = document.getElementById('m-ret');
+    if(mRetEl) {
+        mRetEl.innerText = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}%`;
+        mRetEl.className = `metric-value ${totalPnl >= 0 ? 'up-text' : 'down-text'}`;
+    }
+    const mWinEl = document.getElementById('m-win');
+    if(mWinEl) mWinEl.innerText = tradeCount > 0 ? `${((winCount / tradeCount) * 100).toFixed(1)}%` : '0.0%';
+    const mMddEl = document.getElementById('m-mdd');
+    if(mMddEl) mMddEl.innerText = `${maxLoss.toFixed(2)}%`;
+    const mPfEl = document.getElementById('m-pf');
+    if(mPfEl) mPfEl.innerText = finalPF.toFixed(2);
+    const valOddsEl = document.getElementById('val-odds');
+    if(valOddsEl) valOddsEl.innerText = finalPF.toFixed(2);
+    const probLongEl = document.getElementById('prob-long-val');
+    if(probLongEl) probLongEl.innerText = tradeCount > 0 ? `${((winCount / tradeCount) * 100).toFixed(1)}%` : '0.0%';
+    const probShortEl = document.getElementById('prob-short-val');
+    if(probShortEl) probShortEl.innerText = tradeCount > 0 ? `${(100 - (winCount / tradeCount) * 100).toFixed(1)}%` : '0.0%';
+    updateNextDayGuide();
+}
+function updateNextDayGuide() {
+    const guideBox = document.getElementById('next-action-guide');
+    if(!guideBox) return;
+    const symbol = document.getElementById('stock-symbol').value;
+    const p = stockProfiles[symbol] || { mode: 'TREND', bias: 1.5, chip: 300, trail: 2.5, sl: 2.0 };
+    if (!chartData || chartData.length < 25) {
+        guideBox.innerHTML = '尚無足夠歷史資料計算';
+        return;
+    }
+    let sum20 = 0;
+    for (let j = chartData.length - 20; j < chartData.length; j++) {
+        sum20 += chartData[j].close;
+    }
+    let ma20 = sum20 / 20;
+    let lastClose = chartData[chartData.length - 1].close;
+    let bias = ((lastClose - ma20) / ma20) * 100;
+    let isLong = (p.mode === 'TREND') ? (bias >= 0) : (bias < 0);
+    let actionText = isLong ? '<span class="up-text" style="font-weight:bold;">▲ 做多</span>' : '<span class="down-text" style="font-weight:bold;">▼ 做空</span>';
+    const manualOpenInput = document.getElementById('manual-open-price');
+    let manualInput = manualOpenInput ? manualOpenInput.value : '';
+    let entryPrice = manualInput ? parseFloat(manualInput) : lastClose;
+    let slRatio = p.sl / 100;
+    let hardStop = isLong ? roundToTaiwanTick(entryPrice * (1 - slRatio)) : roundToTaiwanTick(entryPrice * (1 + slRatio));
+    guideBox.innerHTML = `
+        📌 盤前判定方向：${actionText} (乖離: ${bias.toFixed(2)}%)<br>
+        🎯 基準進場(開盤)價: <b>${formatStockPrice(entryPrice)}</b><br>
+        🛑 你的設定硬性停損(${p.sl}%): <b style="color:var(--tw-down-red);">${formatStockPrice(hardStop)}</b><br>
+        🛡️ 移動追蹤防守: 依盤中最高/低即時回撤 ${p.trail}%
+    `;
+}
+function closeModal() {
+    const modal = document.getElementById('report-modal');
+    if(modal) modal.style.display = 'none';
+}
+document.addEventListener('DOMContentLoaded', () => {
+    initChart();
+    selectStock('2327');
+    const fetchBtn = document.getElementById('btn-fetch');
+    if(fetchBtn) fetchBtn.addEventListener('click', fetchFinMindData);
+    const autoOptBtn = document.getElementById('btn-auto-opt');
+    if(autoOptBtn) autoOptBtn.addEventListener('click', runAutoOptimization);
+});
